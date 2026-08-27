@@ -1,0 +1,4 @@
+# PW203 4.4.2.2 module-layout facts, layered over the public SSC027D USB-camera
+# defconfig. Disabling PERF_EVENTS also disables derived MODULES_TREE_LOOKUP.
+# CONFIG_KALLSYMS is not set
+# CONFIG_PERF_EVENTS is not set
