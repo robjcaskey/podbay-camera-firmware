@@ -6,7 +6,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::os::fd::AsRawFd;
 use std::os::raw::{c_int, c_ulong};
-use std::sync::atomic::{AtomicU16, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -256,10 +256,11 @@ const COARSE_LINE_LENGTH: u16 = 0x0b60;
 const COARSE_FRAME_LENGTH: u16 = 1616;
 const COARSE_EXPOSURE: u16 = 1566;
 const COARSE_GAIN: u16 = 930;
+const COARSE_EXPOSURE_MARGIN_LINES: u16 = 50;
 // A valid full-sensor 4x4 exposure arrives in 124-137 ms on this camera. Keep
 // the one-shot wait bounded so a VIF output-port activation miss can be
 // re-armed in the same acquisition cycle instead of hitching for 1.5 seconds.
-const COARSE_FRAME_WAIT: Duration = Duration::from_millis(190);
+const COARSE_FRAME_WAIT: Duration = Duration::from_millis(450);
 // Begin the VIF output re-arm just before the measured 124-137 ms first coarse
 // frame boundary. MI_VIF_DisableOutputPort then synchronizes to that boundary;
 // waiting 145 ms here can enter the following exposure and add another 40-50
@@ -274,6 +275,49 @@ const SCAN_ORIGIN_SETTLE_FRAMES: u32 = 2;
 // touching their pixels; the following STREAM buffer is then the same third
 // post-command exposure that CAPTURE_SCAN proved against independent bands.
 const LIVE_ORIGIN_DISCARD_FRAMES: usize = SCAN_ORIGIN_SETTLE_FRAMES as usize;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ExposureTiming {
+    frame_length: u16,
+    coarse_lines: u16,
+}
+
+impl ExposureTiming {
+    fn from_config(config: &Config) -> Self {
+        Self {
+            frame_length: config.frame_length,
+            coarse_lines: config.coarse,
+        }
+    }
+
+    fn pack(self) -> u32 {
+        (u32::from(self.frame_length) << 16) | u32::from(self.coarse_lines)
+    }
+
+    fn unpack(word: u32) -> Self {
+        Self {
+            frame_length: (word >> 16) as u16,
+            coarse_lines: word as u16,
+        }
+    }
+}
+
+fn matching_coarse_exposure(fine: ExposureTiming) -> ExposureTiming {
+    // The fine and 4x4 modes deliberately retain the same PLL. Preserve
+    // physical integration time across the temporary geometry switch by
+    // converting line counts through their different line lengths. Merely
+    // copying the fine line count would make the global frame about 5x darker.
+    let integration_clocks = u64::from(fine.coarse_lines.max(1)) * u64::from(FINE_LINE_LENGTH);
+    let rounded_lines =
+        (integration_clocks + u64::from(COARSE_LINE_LENGTH) / 2) / u64::from(COARSE_LINE_LENGTH);
+    let maximum_exposure = u16::MAX - COARSE_EXPOSURE_MARGIN_LINES;
+    let coarse_lines = rounded_lines.clamp(1, u64::from(maximum_exposure)) as u16;
+    ExposureTiming {
+        frame_length: COARSE_FRAME_LENGTH
+            .max(coarse_lines.saturating_add(COARSE_EXPOSURE_MARGIN_LINES)),
+        coarse_lines,
+    }
+}
 
 #[repr(C)]
 struct I2cMessage {
@@ -661,6 +705,32 @@ struct ContextStream {
     height: u32,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CaptureFormat {
+    Gray16,
+    Raw10,
+}
+
+impl CaptureFormat {
+    fn parse(value: Option<&str>) -> Result<Self, String> {
+        match value {
+            None => Ok(Self::Gray16),
+            Some(value) if value.eq_ignore_ascii_case("GRAY16") => Ok(Self::Gray16),
+            Some(value) if value.eq_ignore_ascii_case("RAW10") => Ok(Self::Raw10),
+            Some(value) => Err(format!(
+                "capture format must be GRAY16 or RAW10, got {value}"
+            )),
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Gray16 => "GRAY16",
+            Self::Raw10 => "RAW10",
+        }
+    }
+}
+
 enum ClientAction {
     Continue,
     Shutdown,
@@ -674,6 +744,7 @@ enum ClientAction {
         width: u32,
         height: u32,
         sensor_scaled: bool,
+        format: CaptureFormat,
     },
 }
 
@@ -2239,13 +2310,13 @@ fn run() -> Result<(), String> {
     let mut graph = Some(Graph::open(&config)?);
     let live_eye_roi = Arc::new(Mutex::new(None::<LiveEyeRoi>));
     let sensor_mode = Arc::new(Mutex::new(SensorMode::from_config(&config)));
-    let exposure_frame_length = Arc::new(AtomicU16::new(config.frame_length));
+    let exposure_timing = Arc::new(AtomicU32::new(ExposureTiming::from_config(&config).pack()));
     let telemetry = Arc::new(Mutex::new(CameraTelemetry::new()));
     let vcm_control = config.vcm_control.clone();
     let control_roi = Arc::clone(&live_eye_roi);
     let control_mode = Arc::clone(&sensor_mode);
     let control_telemetry = Arc::clone(&telemetry);
-    let control_frame_length = Arc::clone(&exposure_frame_length);
+    let control_exposure_timing = Arc::clone(&exposure_timing);
     thread::Builder::new()
         .name("pw203-vcm-control".to_string())
         .spawn(move || {
@@ -2254,7 +2325,7 @@ fn run() -> Result<(), String> {
                 control_roi,
                 control_mode,
                 control_telemetry,
-                control_frame_length,
+                control_exposure_timing,
             ) {
                 eprintln!("VCM control stopped: {error}");
             }
@@ -2273,7 +2344,7 @@ fn run() -> Result<(), String> {
                     Arc::clone(&live_eye_roi),
                     Arc::clone(&sensor_mode),
                     Arc::clone(&telemetry),
-                    Arc::clone(&exposure_frame_length),
+                    Arc::clone(&exposure_timing),
                 ) {
                     Ok(action) => action,
                     Err(error) => {
@@ -2357,26 +2428,55 @@ fn run() -> Result<(), String> {
                         width,
                         height,
                         sensor_scaled,
+                        format,
                     } => {
+                        let live_timing =
+                            ExposureTiming::unpack(exposure_timing.load(Ordering::Relaxed));
+                        let mut live_fine_config = base_config.clone();
+                        live_fine_config.frame_length = live_timing.frame_length;
+                        live_fine_config.coarse = live_timing.coarse_lines;
                         match capture_full_sensor_coarse_thumbnail(
                             graph.as_mut().ok_or("camera graph unavailable")?,
-                            &base_config,
+                            &live_fine_config,
                             width,
                             height,
                             sensor_scaled,
+                            format,
                         ) {
-                            Ok((payload, timestamp_ns, switch, capture, reduce, restore)) => {
-                                let header = thumbnail_packet_header(
-                                    0,
-                                    sequence,
-                                    timestamp_ns,
-                                    0,
-                                    0,
-                                    width,
-                                    height,
-                                    payload.len() as u32,
-                                    0,
-                                );
+                            Ok((
+                                payload,
+                                timestamp_ns,
+                                stride,
+                                switch,
+                                capture,
+                                reduce,
+                                restore,
+                            )) => {
+                                let header = match format {
+                                    CaptureFormat::Gray16 => thumbnail_packet_header(
+                                        0,
+                                        sequence,
+                                        timestamp_ns,
+                                        0,
+                                        0,
+                                        width,
+                                        height,
+                                        payload.len() as u32,
+                                        0,
+                                    ),
+                                    CaptureFormat::Raw10 => packet_header(
+                                        0,
+                                        sequence,
+                                        timestamp_ns,
+                                        0,
+                                        0,
+                                        width,
+                                        height,
+                                        stride,
+                                        payload.len() as u32,
+                                        0,
+                                    ),
+                                };
                                 stream
                                     .write_all(&header)
                                     .and_then(|()| stream.write_all(&payload))
@@ -2384,8 +2484,9 @@ fn run() -> Result<(), String> {
                                         format!("write coarse sensor thumbnail: {error}")
                                     })?;
                                 eprintln!(
-                                    "full-sensor 4x4 one-shot seq={sequence} sensor-scale={}x output={}x{} switch={} us capture={} us Bayer-strobe={} us fine-restore={} us",
+                                    "full-sensor 4x4 one-shot seq={sequence} sensor-scale={}x format={} output={}x{} switch={} us capture={} us reduction={} us fine-restore={} us",
                                     if sensor_scaled { 2 } else { 1 },
+                                    format.label(),
                                     width,
                                     height,
                                     switch.as_micros(),
@@ -2396,11 +2497,18 @@ fn run() -> Result<(), String> {
                             }
                             Err(error) => {
                                 eprintln!(
-                                    "full-sensor 4x4 one-shot seq={sequence} sensor-scale={}x failed: {error}",
+                                    "full-sensor 4x4 one-shot seq={sequence} sensor-scale={}x format={} failed: {error}",
                                     if sensor_scaled { 2 } else { 1 },
+                                    format.label(),
                                 );
-                                let header =
-                                    thumbnail_packet_header(-1, sequence, 0, 0, 0, 0, 0, 0, 0);
+                                let header = match format {
+                                    CaptureFormat::Gray16 => {
+                                        thumbnail_packet_header(-1, sequence, 0, 0, 0, 0, 0, 0, 0)
+                                    }
+                                    CaptureFormat::Raw10 => {
+                                        packet_header(-1, sequence, 0, 0, 0, 0, 0, 0, 0, 0)
+                                    }
+                                };
                                 stream
                                     .write_all(&header)
                                     .map_err(|write_error| write_error.to_string())?;
@@ -2452,7 +2560,7 @@ fn serve_vcm_control(
     live_eye_roi: Arc<Mutex<Option<LiveEyeRoi>>>,
     sensor_mode: Arc<Mutex<SensorMode>>,
     telemetry: Arc<Mutex<CameraTelemetry>>,
-    exposure_frame_length: Arc<AtomicU16>,
+    exposure_timing: Arc<AtomicU32>,
 ) -> Result<(), String> {
     let listener = TcpListener::bind(address)
         .map_err(|error| format!("bind VCM control {address}: {error}"))?;
@@ -2513,7 +2621,14 @@ fn serve_vcm_control(
                 } else {
                     1200
                 };
-                exposure_frame_length.store(frame_length, Ordering::Relaxed);
+                exposure_timing.store(
+                    ExposureTiming {
+                        frame_length,
+                        coarse_lines: exposure,
+                    }
+                    .pack(),
+                    Ordering::Relaxed,
+                );
             }
             let minimum_frame_length = if current_mode.binning == 1 {
                 FINE_FRAME_LENGTH
@@ -2618,7 +2733,14 @@ fn serve_vcm_control(
                                 Ok(()) => {
                                     exposure = next;
                                     frame_length = next_frame_length;
-                                    exposure_frame_length.store(frame_length, Ordering::Relaxed);
+                                    exposure_timing.store(
+                                        ExposureTiming {
+                                            frame_length,
+                                            coarse_lines: exposure,
+                                        }
+                                        .pack(),
+                                        Ordering::Relaxed,
+                                    );
                                     format!("OK EXPOSURE {exposure} FRAME_LENGTH {frame_length}\n")
                                 }
                                 Err(error) => format!("ERR {error}\n"),
@@ -2640,7 +2762,14 @@ fn serve_vcm_control(
                                 Ok(()) => {
                                     exposure = next;
                                     frame_length = next_frame_length;
-                                    exposure_frame_length.store(frame_length, Ordering::Relaxed);
+                                    exposure_timing.store(
+                                        ExposureTiming {
+                                            frame_length,
+                                            coarse_lines: exposure,
+                                        }
+                                        .pack(),
+                                        Ordering::Relaxed,
+                                    );
                                     format!("OK EXPOSURE {exposure} FRAME_LENGTH {frame_length}\n")
                                 }
                                 Err(error) => format!("ERR {error}\n"),
@@ -2733,7 +2862,7 @@ fn serve_client(
     live_eye_roi: Arc<Mutex<Option<LiveEyeRoi>>>,
     sensor_mode: Arc<Mutex<SensorMode>>,
     telemetry: Arc<Mutex<CameraTelemetry>>,
-    exposure_frame_length: Arc<AtomicU16>,
+    exposure_timing: Arc<AtomicU32>,
 ) -> Result<ClientAction, String> {
     let peer = stream.peer_addr().ok();
     stream
@@ -2862,28 +2991,32 @@ fn serve_client(
             }
             continue;
         }
-        if fields[0].eq_ignore_ascii_case("CAPTURE_COARSE") && fields.len() == 4 {
+        if fields[0].eq_ignore_ascii_case("CAPTURE_COARSE") && matches!(fields.len(), 4 | 5) {
             let sequence = parse::<u64>(fields[1], "sequence")?;
             let output_width = parse::<u32>(fields[2], "coarse thumbnail width")?;
             let output_height = parse::<u32>(fields[3], "coarse thumbnail height")?;
+            let format = CaptureFormat::parse(fields.get(4).copied())?;
             return Ok(ClientAction::CoarseCapture {
                 stream,
                 sequence,
                 width: output_width,
                 height: output_height,
                 sensor_scaled: false,
+                format,
             });
         }
-        if fields[0].eq_ignore_ascii_case("CAPTURE_GLOBAL") && fields.len() == 4 {
+        if fields[0].eq_ignore_ascii_case("CAPTURE_GLOBAL") && matches!(fields.len(), 4 | 5) {
             let sequence = parse::<u64>(fields[1], "sequence")?;
             let output_width = parse::<u32>(fields[2], "global thumbnail width")?;
             let output_height = parse::<u32>(fields[3], "global thumbnail height")?;
+            let format = CaptureFormat::parse(fields.get(4).copied())?;
             return Ok(ClientAction::CoarseCapture {
                 stream,
                 sequence,
                 width: output_width,
                 height: output_height,
                 sensor_scaled: true,
+                format,
             });
         }
         if fields[0].eq_ignore_ascii_case("CAPTURE_THUMB") && fields.len() == 7 {
@@ -3069,7 +3202,7 @@ fn serve_client(
                 context,
                 live_eye_roi,
                 telemetry,
-                exposure_frame_length,
+                exposure_timing,
             )?;
             break;
         }
@@ -3150,7 +3283,7 @@ fn stream_eye_rois(
     context: Option<ContextStream>,
     live_eye_roi: Arc<Mutex<Option<LiveEyeRoi>>>,
     telemetry: Arc<Mutex<CameraTelemetry>>,
-    exposure_frame_length: Arc<AtomicU16>,
+    exposure_timing: Arc<AtomicU32>,
 ) -> Result<(), String> {
     let mode = SensorMode::from_config(config);
     validate_absolute_eye_rois(mode, eyes, eye_width, eye_height)?;
@@ -3301,8 +3434,8 @@ fn stream_eye_rois(
         let completed = Instant::now();
         completed_sets.push_back(completed);
         let frame_length = usize::from(
-            exposure_frame_length
-                .load(Ordering::Relaxed)
+            ExposureTiming::unpack(exposure_timing.load(Ordering::Relaxed))
+                .frame_length
                 .max(FINE_FRAME_LENGTH),
         );
         let required_sets = (MIN_RAW_ROI_SETS_PER_SECOND * usize::from(FINE_FRAME_LENGTH))
@@ -3413,7 +3546,8 @@ fn capture_full_sensor_coarse_thumbnail(
     output_width: u32,
     output_height: u32,
     sensor_scaled: bool,
-) -> Result<(Vec<u8>, u64, Duration, Duration, Duration, Duration), String> {
+    format: CaptureFormat,
+) -> Result<(Vec<u8>, u64, u32, Duration, Duration, Duration, Duration), String> {
     if fine_config.sensor_binning != 1
         || !fine_config.direct_full_raw
         || fine_config.initial_x != 0
@@ -3428,15 +3562,26 @@ fn capture_full_sensor_coarse_thumbnail(
             fine_config.sensor_binning,
         ));
     }
-    let coarse = if sensor_scaled {
+    let mut coarse = if sensor_scaled {
         full_sensor_scaled_config(fine_config)?
     } else {
         sensor_crop_config(fine_config, 0, 0, SENSOR_WIDTH, SENSOR_HEIGHT, 4)?
     };
-    let (maximum_width, maximum_height) = if sensor_scaled {
-        (coarse.tile_width, coarse.tile_height)
-    } else {
-        (coarse.tile_width / 2, coarse.tile_height / 2)
+    let fine_timing = ExposureTiming::from_config(fine_config);
+    let coarse_timing = matching_coarse_exposure(fine_timing);
+    coarse.frame_length = coarse_timing.frame_length;
+    coarse.coarse = coarse_timing.coarse_lines;
+    coarse.gain = fine_config.gain;
+    // The warm provider's FPS value is framework timing metadata. Keep it in
+    // step with the inherited fine exposure instead of advertising the old
+    // short-exposure 15 fps cadence while the sensor is producing ~10 fps.
+    coarse.sensor_fps = fine_config.sensor_fps;
+    validate_config(&coarse)?;
+    let (maximum_width, maximum_height) = match (format, sensor_scaled) {
+        (CaptureFormat::Raw10, _) | (CaptureFormat::Gray16, true) => {
+            (coarse.tile_width, coarse.tile_height)
+        }
+        (CaptureFormat::Gray16, false) => (coarse.tile_width / 2, coarse.tile_height / 2),
     };
     if output_width == 0
         || output_height == 0
@@ -3444,12 +3589,30 @@ fn capture_full_sensor_coarse_thumbnail(
         || output_height > maximum_height
     {
         return Err(format!(
-            "coarse Bayer-strobe thumbnail {}x{} must be at most {}x{}",
-            output_width, output_height, maximum_width, maximum_height,
+            "coarse {} thumbnail {}x{} must be at most {}x{}",
+            format.label(),
+            output_width,
+            output_height,
+            maximum_width,
+            maximum_height,
+        ));
+    }
+    if format == CaptureFormat::Raw10 && (output_width & 3 != 0 || output_height & 1 != 0) {
+        return Err(format!(
+            "packed RAW10 thumbnail {}x{} requires width divisible by 4 and even height",
+            output_width, output_height,
         ));
     }
 
     let switch_started = Instant::now();
+    eprintln!(
+        "matching global integration: fine={} lines x {} clocks, global={} lines x {} clocks, gain={}",
+        fine_timing.coarse_lines,
+        FINE_LINE_LENGTH,
+        coarse_timing.coarse_lines,
+        COARSE_LINE_LENGTH,
+        coarse.gain,
+    );
     // A changed SigmaStar VIF line geometry is accepted on the first resident
     // retune, but its output port remains working-inactive for that first
     // coarse exposure. Let the measured 124-137 ms exposure finish, then
@@ -3542,22 +3705,28 @@ fn capture_full_sensor_coarse_thumbnail(
     let reduce_started = Instant::now();
     let reduced = frame.and_then(|frame| {
         let timestamp_ns = frame.timestamp_ns;
-        let reduction = if sensor_scaled {
-            downsample_raw10_gray_strobe(
+        let reduction = match (format, sensor_scaled) {
+            (CaptureFormat::Raw10, _) => resample_raw10_bayer(
                 &frame,
                 coarse.tile_width,
                 coarse.tile_height,
                 output_width,
                 output_height,
-            )
-        } else {
-            downsample_raw10_gray(
+            ),
+            (CaptureFormat::Gray16, true) => downsample_raw10_gray_strobe(
                 &frame,
                 coarse.tile_width,
                 coarse.tile_height,
                 output_width,
                 output_height,
-            )
+            ),
+            (CaptureFormat::Gray16, false) => downsample_raw10_gray(
+                &frame,
+                coarse.tile_width,
+                coarse.tile_height,
+                output_width,
+                output_height,
+            ),
         };
         reduction.map(|payload| (payload, timestamp_ns))
     });
@@ -3567,6 +3736,10 @@ fn capture_full_sensor_coarse_thumbnail(
         (Ok((payload, timestamp_ns)), Ok(())) => Ok((
             payload,
             timestamp_ns,
+            match format {
+                CaptureFormat::Gray16 => output_width * 2,
+                CaptureFormat::Raw10 => output_width / 4 * 5,
+            },
             switch_elapsed,
             capture_elapsed,
             reduce_elapsed,
@@ -3826,6 +3999,74 @@ fn downsample_raw10_gray_strobe(
                 + packed_raw10_pixel(frame, sample_x, sample_y + 1) as u32
                 + packed_raw10_pixel(frame, sample_x + 1, sample_y + 1) as u32;
             output.extend_from_slice(&((sum / 4) as u16).to_le_bytes());
+        }
+    }
+    Ok(output)
+}
+
+fn push_raw10_group(output: &mut Vec<u8>, pixels: [u16; 4]) {
+    let packed = u64::from(pixels[0] & 0x03ff)
+        | (u64::from(pixels[1] & 0x03ff) << 10)
+        | (u64::from(pixels[2] & 0x03ff) << 20)
+        | (u64::from(pixels[3] & 0x03ff) << 30);
+    output.extend_from_slice(&packed.to_le_bytes()[..5]);
+}
+
+/// Resize a packed Bayer frame without mixing color phases. Every output 2x2
+/// cell samples one proportional source 2x2 cell, so RGGB phase remains valid
+/// for host-side demosaic. Native-size requests preserve every RAW10 sample.
+fn resample_raw10_bayer(
+    frame: &RawFrame,
+    width: u32,
+    height: u32,
+    output_width: u32,
+    output_height: u32,
+) -> Result<Vec<u8>, String> {
+    if width == 0
+        || height == 0
+        || width & 1 != 0
+        || height & 1 != 0
+        || output_width == 0
+        || output_height == 0
+        || output_width & 3 != 0
+        || output_height & 1 != 0
+        || output_width > width
+        || output_height > height
+    {
+        return Err(format!(
+            "phase-preserving RAW10 resize {}x{} -> {}x{} requires even input, output width divisible by 4, even output height, and no enlargement",
+            width, height, output_width, output_height,
+        ));
+    }
+    if frame.stride as usize * height as usize > frame.bytes.len() {
+        return Err("captured RAW10 payload is shorter than its declared geometry".to_string());
+    }
+    if output_width == width && output_height == height {
+        return crop_raw10_bytes(&frame.bytes, frame.stride as usize, 0, 0, width, height);
+    }
+
+    let source_cells_x = width as usize / 2;
+    let source_cells_y = height as usize / 2;
+    let output_cells_x = output_width as usize / 2;
+    let output_cells_y = output_height as usize / 2;
+    let mut output = Vec::with_capacity((output_width / 4 * 5 * output_height) as usize);
+    for output_y in 0..output_height as usize {
+        let output_cell_y = output_y / 2;
+        let source_cell_y = ((2 * output_cell_y + 1) * source_cells_y / (2 * output_cells_y))
+            .min(source_cells_y - 1);
+        let source_y = source_cell_y * 2 + output_y % 2;
+        for output_group_x in (0..output_width as usize).step_by(4) {
+            let mut pixels = [0u16; 4];
+            for (offset, pixel) in pixels.iter_mut().enumerate() {
+                let output_x = output_group_x + offset;
+                let output_cell_x = output_x / 2;
+                let source_cell_x = ((2 * output_cell_x + 1) * source_cells_x
+                    / (2 * output_cells_x))
+                    .min(source_cells_x - 1);
+                let source_x = source_cell_x * 2 + output_x % 2;
+                *pixel = packed_raw10_pixel(frame, source_x, source_y);
+            }
+            push_raw10_group(&mut output, pixels);
         }
     }
     Ok(output)
@@ -4139,7 +4380,7 @@ fn parse_args(args: Vec<String>) -> Result<Config, String> {
                      [--settle N] [--timeout-ms N] [--frame-length N] [--coarse N] [--gain N] \
                      [--sensor-res N] [--sensor-fps N] [--sensor-binning 1|4] [--native-mode]\n\
                      image protocol: SENSOR GET|PREVIEW|SET X Y PHYSICAL_W PHYSICAL_H BINNING, CAPTURE_CURRENT, \
-                     CAPTURE_THUMB, CAPTURE_SCAN/CAPTURE_COARSE sequence WIDTH HEIGHT, or STREAM_EYES sequence LEFT_ABS_X LEFT_ABS_Y RIGHT_ABS_X RIGHT_ABS_Y \
+                     CAPTURE_THUMB, CAPTURE_SCAN, CAPTURE_COARSE/CAPTURE_GLOBAL sequence WIDTH HEIGHT [GRAY16|RAW10], or STREAM_EYES sequence LEFT_ABS_X LEFT_ABS_Y RIGHT_ABS_X RIGHT_ABS_Y \
                      EYE_W EYE_H [frames [context_every context_width context_height]]; \
                      VCM protocol: FOCUS GET|STATUS|SET|STEP | EXPOSURE GET|SET|STEP | \
                      ROI SET LEFT_ABS_X LEFT_ABS_Y RIGHT_ABS_X RIGHT_ABS_Y EYE_W EYE_H"
@@ -4383,6 +4624,30 @@ mod tests {
     }
 
     #[test]
+    fn global_capture_preserves_physical_integration_time_across_line_lengths() {
+        for fine_lines in [FINE_EXPOSURE, 2800, 8000] {
+            let coarse = matching_coarse_exposure(ExposureTiming {
+                frame_length: fine_lines + 1,
+                coarse_lines: fine_lines,
+            });
+            let fine_clocks = u64::from(fine_lines) * u64::from(FINE_LINE_LENGTH);
+            let coarse_clocks = u64::from(coarse.coarse_lines) * u64::from(COARSE_LINE_LENGTH);
+            assert!(fine_clocks.abs_diff(coarse_clocks) <= u64::from(COARSE_LINE_LENGTH) / 2);
+            assert!(coarse.frame_length >= coarse.coarse_lines + COARSE_EXPOSURE_MARGIN_LINES);
+        }
+        assert_eq!(
+            matching_coarse_exposure(ExposureTiming {
+                frame_length: 2801,
+                coarse_lines: 2800,
+            }),
+            ExposureTiming {
+                frame_length: 14188,
+                coarse_lines: 14138,
+            },
+        );
+    }
+
+    #[test]
     fn direct_raw_geometry_changes_keep_the_sigma_star_graph_resident() {
         let base = Config::default();
         let fine = sensor_crop_config(&base, 0, 2808, 8000, 768, 1).unwrap();
@@ -4438,6 +4703,63 @@ mod tests {
                 .len(),
             98,
         );
+    }
+
+    #[test]
+    fn capture_format_is_explicit_and_gray16_remains_the_default() {
+        assert_eq!(CaptureFormat::parse(None).unwrap(), CaptureFormat::Gray16);
+        assert_eq!(
+            CaptureFormat::parse(Some("gray16")).unwrap(),
+            CaptureFormat::Gray16,
+        );
+        assert_eq!(
+            CaptureFormat::parse(Some("RAW10")).unwrap(),
+            CaptureFormat::Raw10,
+        );
+        assert!(CaptureFormat::parse(Some("JPEG")).is_err());
+    }
+
+    #[test]
+    fn raw10_thumbnail_resize_preserves_bayer_phase_and_native_samples() {
+        let width = 8usize;
+        let height = 4usize;
+        let stride = width / 4 * 5;
+        let mut bytes = Vec::with_capacity(stride * height);
+        for y in 0..height {
+            for x in (0..width).step_by(4) {
+                push_raw10_group(
+                    &mut bytes,
+                    [
+                        (y * 100 + x) as u16,
+                        (y * 100 + x + 1) as u16,
+                        (y * 100 + x + 2) as u16,
+                        (y * 100 + x + 3) as u16,
+                    ],
+                );
+            }
+        }
+        let frame = RawFrame {
+            bytes: bytes.clone(),
+            stride: stride as u32,
+            timestamp_ns: 0,
+        };
+
+        assert_eq!(resample_raw10_bayer(&frame, 8, 4, 8, 4).unwrap(), bytes,);
+        let reduced = resample_raw10_bayer(&frame, 8, 4, 4, 2).unwrap();
+        assert_eq!(reduced.len(), 10);
+        assert_eq!(
+            (0..4)
+                .map(|x| packed_raw10_pixel_bytes(&reduced, 5, x, 0))
+                .collect::<Vec<_>>(),
+            vec![202, 203, 206, 207],
+        );
+        assert_eq!(
+            (0..4)
+                .map(|x| packed_raw10_pixel_bytes(&reduced, 5, x, 1))
+                .collect::<Vec<_>>(),
+            vec![302, 303, 306, 307],
+        );
+        assert!(resample_raw10_bayer(&frame, 8, 4, 4, 3).is_err());
     }
 
     #[test]

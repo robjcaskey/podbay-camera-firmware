@@ -19,8 +19,8 @@ Image commands and their binary responses include:
 | `SENSOR PREVIEW` | text, after transition | Select the built-in preview geometry |
 | `CAPTURE_CURRENT SEQ [SETTLE]` | `ORT1` | One packed RAW10 frame |
 | `CAPTURE_THUMB SEQ X Y SETTLE W H` | `OTH1` | One little-endian gray16 thumbnail |
-| `CAPTURE_COARSE SEQ W H` | `OTH1` | One coarse full-sensor thumbnail |
-| `CAPTURE_GLOBAL SEQ W H` | `OTH1` | One low-bandwidth full-field thumbnail using native 4x4 binning and 2x sensor scaling |
+| `CAPTURE_COARSE SEQ W H [GRAY16\|RAW10]` | `OTH1` or `ORT1` | One coarse full-sensor thumbnail; omitted format defaults to GRAY16 |
+| `CAPTURE_GLOBAL SEQ W H [GRAY16\|RAW10]` | `OTH1` or `ORT1` | One low-bandwidth full-field thumbnail using native 4x4 binning and 2x sensor scaling; omitted format defaults to GRAY16 |
 | `STREAM_EYES SEQ LX LY RX RY W H [FRAMES [EVERY CW CH]]` | `ORE1`, optionally `OTH1` and `OTM1` | Paired RAW10 eye stream used by the existing tracker |
 | `QUIT` | none | Close the client connection |
 
@@ -70,7 +70,14 @@ eye tracker remains compatible because the copied server retains the unchanged
 `STREAM_EYES` and `ORE1` implementation.
 
 `CAPTURE_GLOBAL` covers the complete 8000x6000 photosite array while emitting
-only 1000x750 RAW10 over CSI/DMA. The service phase-safely averages 2x2 Bayer
-cells into the requested gray16 dimensions (up to 1000x750); dimensions above
-500x375 are compatibility resampling and do not contain additional sensor
-detail. The pre-existing `CAPTURE_COARSE` command remains unchanged.
+only 1000x750 RAW10 over CSI/DMA. `GRAY16` phase-safely averages 2x2 Bayer
+cells into the requested dimensions (up to 1000x750); dimensions above 500x375
+are compatibility resampling and do not contain additional sensor detail.
+`RAW10` returns packed LE40 Bayer data in an `ORT1` packet. A native
+1000x750 RAW10 request preserves the scaled-sensor payload sample-for-sample;
+smaller requests select proportional 2x2 source cells without mixing CFA
+phases. RAW10 widths must be divisible by four and heights must be even.
+The temporary 4x4 mode converts the currently active fine-stream exposure
+through the two modes' line lengths, preserving physical integration time and
+analog gain before restoring that same fine exposure. It does not substitute a
+fixed preview exposure.
